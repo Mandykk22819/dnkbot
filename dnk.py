@@ -46,24 +46,44 @@ def get_markov_model(chat_id):
     return markovify.NewlineText(corpus, state_size=1) #Осмысленность предложений
 
 def generate_phrase(chat_id):
-    """Генерирует фразу на основе сообщений из конкретного чата"""
-    model = get_markov_model(chat_id)
-    if model is None:
+    """Генерирует фразу: сначала пытается с state_size=2, если дублируется - падает на state_size=1"""
+    corpus = load_corpus(chat_id)
+    if len(corpus.split()) < 10:
         return "Я аутист и мне не хватает слов 😅"
 
-    # Получаем историю фраз для этого чата
+    # Получаем историю для этого чата
     if chat_id not in last_phrases:
         last_phrases[chat_id] = []
     history = last_phrases[chat_id]
 
-    for _ in range(5):
-        phrase = model.make_sentence(max_words=50, tries=100)
-        if phrase and len(phrase.split()) > 1:
-            if phrase not in history:
-                history.append(phrase)
-                if len(history) > 10:
-                    history.pop(0)
-                return phrase
+    # --- Попытка 1: умная модель (state_size=2) ---
+    try:
+        model_v2 = markovify.NewlineText(corpus, state_size=2)
+        for _ in range(10):  # Даем больше попыток, чтобы найти уникальную фразу
+            phrase = model_v2.make_sentence(max_words=30, tries=200)
+            if phrase and len(phrase.split()) > 3:
+                if phrase not in history:
+                    history.append(phrase)
+                    if len(history) > 10:
+                        history.pop(0)
+                    return phrase
+    except KeyError:
+        pass  # Модель не построилась, идем дальше
+
+    # --- Попытка 2: простая модель (state_size=1) если умная не справилась ---
+    try:
+        model_v1 = markovify.NewlineText(corpus, state_size=1)
+        for _ in range(10):
+            phrase = model_v1.make_sentence(max_words=30, tries=200)
+            if phrase and len(phrase.split()) > 2:
+                if phrase not in history:
+                    history.append(phrase)
+                    if len(history) > 10:
+                        history.pop(0)
+                    return phrase
+    except KeyError:
+        pass
+
     return "Я не могу придумать смехуятину 🤔"
 
 async def send_reply(update, context, text=None):
