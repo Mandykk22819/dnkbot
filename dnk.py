@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import copy
 import functools
@@ -6,7 +8,7 @@ import logging
 import os
 import random
 import re
-from collections import defaultdict
+from collections import OrderedDict, defaultdict, deque
 
 import markovify
 from telegram import Update
@@ -25,10 +27,21 @@ DEFAULT_CHANCE = 0.01              # шанс спонтанной генера�
 REACTION_CHANCE = 0.03             # шанс поставить эмодзи-реакцию вместо ответа
 REBUILD_EVERY_N_MESSAGES = 5       # раз в сколько новых сообщений пересобирать модель
 HISTORY_LIMIT = 10                 # сколько последних фраз помнить, чтобы не повторяться
+GENERATION_ATTEMPTS = 20           # сколько раз пробовать сгенерировать неповторяющуюся фразу
 SETTINGS_FILE = "chat_settings.json"
 
-FALLBACK_NO_MODEL = "Я аутист и мне не хватает слов 😅"
-FALLBACK_NO_PHRASE = "Я не могу придумать смехуятину 🤔"
+# Ограничения по памяти и диску (рассчитаны на сервер с 1 ГБ RAM)
+MAX_CORPUS_LINES = 20000           # сколько последних сообщений хранить на чат
+TRIM_SLACK = 2000                  # обрезаем файл не на каждое сообщение, а когда набежит запас
+MAX_CACHED_MODELS = 5              # сколько моделей одновременно держать в памяти
+MAX_MESSAGE_CHARS = 1000           # слишком длинные сообщения не запоминаем
+
+# Стикерпак: короткое имя из ссылки t.me/addstickers/ИМЯ_ПАКА (пустая строка = выключено)
+STICKER_PACK_NAME = "MandykPack"
+STICKER_CHANCE = 0.1               # шанс, что вместо текстового ответа бот отправит стикер из пака
+
+FALLBACK_NO_MODEL = "Мне не хватает слов"
+FALLBACK_NO_PHRASE = "Я не могу придумать ответ"
 FALLBACK_NO_START = "Не получилось придумать фразу с этим словом 🤷"
 
 # Реакции, которые Telegram разрешает ставить ботам
@@ -42,8 +55,14 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════
 last_phrases: dict[int, list[str]] = defaultdict(list)
 
-# Кэш модели: chat_id -> {"model": Markov | None, "count": сообщений на момент сборки}
-_model_cache: dict[int, dict] = {}
+# Кэш моделей (LRU): chat_id -> {"model": Markov | None, "count": сообщений на момент сборки}
+_model_cache: OrderedDict[int, dict] = OrderedDict()
+
+# Счётчик строк в файле каждого чата, чтобы не читать файл ради подсчёта
+_line_counts: dict[int, int] = {}
+
+# Последнее сохранённое сообщение чата, чтобы не писать подряд одинаковые
+_last_saved: dict[int, str] = {}
 
 # Блокировка на чат, чтобы параллельные апдейты не портили файл/кэш
 _chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -158,24 +177,63 @@ def _load_corpus_sync(chat_id: int) -> str:
         return f.read()
 
 
-def _clear_corpus_sync(chat_id: int) -> None:
+def _count_lines_sync(chat_id: int) -> int:
+    """Считает строки потоково, не загружая файл в память целиком."""
     filename = get_corpus_file(chat_id)
-    if os.path.exists(filename):
-        os.remove(filename)
+    if not os.path.exists(filename):
+        return 0
+    with open(filename, "r", encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
+def _corpus_stats_sync(chat_id: int) -> tuple[int, int]:
+    """Возвращает (число строк, число слов), читая файл потоково."""
+    filename = get_corpus_file(chat_id)
+    if not os.path.exists(filename):
+        return 0, 0
+    lines = words = 0
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            lines += 1
+            words += len(line.split())
+    return lines, words
+
+
+def _trim_corpus_sync(chat_id: int, keep: int) -> int:
+    """Оставляет в файле только последние keep строк. Возвращает их число."""
+    filename = get_corpus_file(chat_id)
+    with open(filename, "r", encoding="utf-8") as f:
+        tail = deque(f, maxlen=keep)
+    tmp = filename + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(tail)
+    os.replace(tmp, filename)  # атомарная замена
+    return len(tail)
+
+
+async def get_line_count(chat_id: int) -> int:
+    """Число сообщений в файле чата. С диска считается один раз, дальше из памяти."""
+    if chat_id not in _line_counts:
+        _line_counts[chat_id] = await asyncio.to_thread(_count_lines_sync, chat_id)
+    return _line_counts[chat_id]
 
 
 async def save_message(chat_id: int, text: str) -> None:
     if not text:
         return
+    if _last_saved.get(chat_id) == text:
+        return  # не пишем подряд одинаковые сообщения (спам/копипаста)
+
+    count = await get_line_count(chat_id)
     await asyncio.to_thread(_save_message_sync, chat_id, text)
+    _last_saved[chat_id] = text
+    count += 1
+    _line_counts[chat_id] = count
 
-
-async def load_corpus(chat_id: int) -> str:
-    return await asyncio.to_thread(_load_corpus_sync, chat_id)
-
-
-async def clear_corpus(chat_id: int) -> None:
-    await asyncio.to_thread(_clear_corpus_sync, chat_id)
+    # Файл не растёт бесконечно: когда набежал запас, оставляем последние MAX_CORPUS_LINES
+    if count > MAX_CORPUS_LINES + TRIM_SLACK:
+        _line_counts[chat_id] = await asyncio.to_thread(_trim_corpus_sync, chat_id, MAX_CORPUS_LINES)
+        invalidate_model_cache(chat_id)  # счётчик уменьшился, модель надо пересобрать
 
 
 # ═══════════════════════════════════════════════════
@@ -197,18 +255,30 @@ def _build_model(corpus: str):
     return None
 
 
+def _build_model_from_file(chat_id: int):
+    """Читает корпус и собирает модель в одном потоке (корпус не задерживается в памяти)."""
+    return _build_model(_load_corpus_sync(chat_id))
+
+
+def _cache_put(chat_id: int, entry: dict) -> None:
+    _model_cache[chat_id] = entry
+    _model_cache.move_to_end(chat_id)
+    while len(_model_cache) > MAX_CACHED_MODELS:
+        _model_cache.popitem(last=False)  # выгружаем давно не использованную модель
+
+
 async def get_markov_model(chat_id: int):
     """Возвращает модель из кэша, пересобирая её раз в REBUILD_EVERY_N_MESSAGES
     новых сообщений, а не на каждый вызов."""
-    corpus = await load_corpus(chat_id)
-    msg_count = corpus.count("\n")
+    msg_count = await get_line_count(chat_id)
 
     cached = _model_cache.get(chat_id)
     if cached and msg_count - cached["count"] < REBUILD_EVERY_N_MESSAGES:
+        _model_cache.move_to_end(chat_id)
         return cached["model"]
 
-    model = await asyncio.to_thread(_build_model, corpus)
-    _model_cache[chat_id] = {"model": model, "count": msg_count}
+    model = await asyncio.to_thread(_build_model_from_file, chat_id)
+    _cache_put(chat_id, {"model": model, "count": msg_count})
     return model
 
 
@@ -237,6 +307,22 @@ def _make_sentence(model, start: str | None = None):
     return model.make_sentence(max_words=50, tries=100)
 
 
+def _pick_phrase(model, start: str | None, recent: list[str]):
+    """Все попытки генерации одним вызовом (один переход в поток вместо 20).
+    Возвращает первую фразу, которой нет среди recent, а если все повторяются —
+    первую удачную. None, если не удалось ничего."""
+    best_phrase = None
+    for _ in range(GENERATION_ATTEMPTS):
+        phrase = _make_sentence(model, start)
+        if not phrase or len(phrase.split()) <= 1:
+            continue
+        if best_phrase is None:
+            best_phrase = phrase  # запасной вариант, если всё будет повтором
+        if phrase not in recent:
+            return phrase
+    return best_phrase
+
+
 async def generate_phrase(chat_id: int, start: str | None = None) -> str:
     model = await get_markov_model(chat_id)
     if model is None:
@@ -250,30 +336,14 @@ async def generate_phrase(chat_id: int, start: str | None = None) -> str:
     # словаря модели: чем меньше уникальных слов, тем меньше окно.
     vocab_size = len(model.chain.model)
     effective_window = max(1, min(HISTORY_LIMIT, vocab_size // 3))
-    recent = history[-effective_window:] if effective_window else []
+    recent = history[-effective_window:]
 
-    best_phrase = None
-    attempts = 20  # больше попыток компенсирует малое число возможных фраз
-
-    for _ in range(attempts):
-        phrase = await asyncio.to_thread(_make_sentence, model, start)
-        if not phrase or len(phrase.split()) <= 1:
-            continue
-        if best_phrase is None:
-            best_phrase = phrase  # запасной вариант, если всё будет повтором
-        if phrase not in recent:
-            history.append(phrase)
-            if len(history) > HISTORY_LIMIT:
-                history.pop(0)
-            return phrase
-
-    # Все попытки дали фразы, уже встречавшиеся недавно — лучше повторить
-    # что-то осмысленное, чем каждый раз отвечать одинаковой заглушкой.
-    if best_phrase:
-        history.append(best_phrase)
+    phrase = await asyncio.to_thread(_pick_phrase, model, start, recent)
+    if phrase:
+        history.append(phrase)
         if len(history) > HISTORY_LIMIT:
             history.pop(0)
-        return best_phrase
+        return phrase
 
     return FALLBACK_NO_START if start else FALLBACK_NO_PHRASE
 
@@ -293,8 +363,45 @@ async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text=No
         logger.warning("Не удалось отправить сообщение в чат %s: %s", chat_id, e)
 
 
+_sticker_cache: list[str] = []
+
+
+async def _load_stickers(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    """Загружает file_id стикеров из пака один раз и кэширует."""
+    global _sticker_cache
+    if _sticker_cache:
+        return _sticker_cache
+    if not STICKER_PACK_NAME:
+        return []
+    try:
+        sticker_set = await context.bot.get_sticker_set(STICKER_PACK_NAME)
+    except TelegramError as e:
+        logger.warning("Не удалось загрузить стикерпак %s: %s", STICKER_PACK_NAME, e)
+        return []
+    _sticker_cache = [s.file_id for s in sticker_set.stickers]
+    return _sticker_cache
+
+
+async def maybe_send_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """С шансом STICKER_CHANCE отвечает случайным стикером из пака.
+    Возвращает True, если стикер отправлен (тогда текст слать не нужно)."""
+    if random.random() >= STICKER_CHANCE:
+        return False
+    stickers = await _load_stickers(context)
+    if not stickers:
+        return False
+    try:
+        await update.message.reply_sticker(random.choice(stickers))
+        return True
+    except TelegramError as e:
+        logger.warning("Не удалось отправить стикер в чат %s: %s", update.message.chat_id, e)
+        return False
+
+
 async def reply_if_real_phrase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отвечает фразой, только если удалось сгенерировать настоящую (без заглушек)."""
+    if await maybe_send_sticker(update, context):
+        return
     phrase = await generate_phrase(update.message.chat_id)
     if is_real_phrase(phrase):
         await send_reply(update, context, text=phrase)
@@ -314,19 +421,18 @@ async def react_to_message(update: Update) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 Привет! Я бот-генератор на цепях Маркова.\n\n"
+        "👋 Привет! Я бот-генератор Dnk на цепях Маркова.\n\n"
         "📝 Упомяни меня или ответь на моё сообщение, чтобы я сгенерировал фразу.\n"
         "🎲 Иногда я пишу сам или ставлю реакции, если мне есть что сказать.\n\n"
         "ℹ️ Я запоминаю сообщения из этого чата, чтобы учиться на них говорить.\n\n"
-        "Команды для всех:\n"
+        "Стандартные команды:\n"
         "/gen — сгенерировать фразу\n"
-        "/gen слово — фраза со словом\n"
+        "/gen СЛОВО — фраза со словом\n"
         "/stats — статистика по этому чату\n\n"
-        "Только для админов:\n"
-        "/chance 5 — шанс спонтанных сообщений в % (0–100)\n"
+        "Админ команды:\n"
+        "/chance 0-100 — шанс спонтанных сообщений в %\n"
         "/mute — заставить меня молчать (но учиться я продолжу)\n"
-        "/unmute — снова разрешить говорить\n"
-        "/clear — очистить память этого чата"
+        "/unmute — снова разрешить говорить"
     )
 
 
@@ -334,16 +440,6 @@ async def gen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     start_word = context.args[0] if context.args else None
     phrase = await generate_phrase(update.message.chat_id, start_word)
     await send_reply(update, context, text=phrase)
-
-
-@admin_only
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.message.chat_id
-    async with _get_lock(chat_id):
-        await clear_corpus(chat_id)
-        last_phrases[chat_id].clear()
-        invalidate_model_cache(chat_id)
-    await update.message.reply_text("🗑️ Память этого чата очищена!")
 
 
 @admin_only
@@ -389,13 +485,11 @@ async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
-    corpus = await load_corpus(chat_id)
-    lines = corpus.splitlines() if corpus else []
-    word_count = len(corpus.split())
+    lines, word_count = await asyncio.to_thread(_corpus_stats_sync, chat_id)
     status = "молчу 🤐" if is_muted(chat_id) else "говорю 🔊"
     await update.message.reply_text(
         f"📊 В этом чате запомнено:\n"
-        f"Сообщений: {len(lines)}\n"
+        f"Сообщений: {lines}\n"
         f"Слов: {word_count}\n\n"
         f"Статус: {status}\n"
         f"Шанс спонтанных сообщений: {get_chance(chat_id) * 100:g}%"
@@ -431,7 +525,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # почти не дают полезных переходов для цепи Маркова).
     # Учимся всегда, даже когда бот в муте.
     clean = clean_text(text)
-    if clean and len(clean.split()) >= 2:
+    if clean and len(clean.split()) >= 2 and len(clean) <= MAX_MESSAGE_CHARS:
         async with _get_lock(chat_id):
             await save_message(chat_id, clean)
 
@@ -439,6 +533,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if is_mentioned or is_reply_to_bot:
+        if await maybe_send_sticker(update, context):
+            return
         await send_reply(update, context)
         return
 
@@ -506,7 +602,6 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("gen", gen))
-    app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("chance", chance))
     app.add_handler(CommandHandler("mute", mute))
     app.add_handler(CommandHandler("unmute", unmute))
