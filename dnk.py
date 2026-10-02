@@ -1,4 +1,7 @@
 import asyncio
+import copy
+import functools
+import json
 import logging
 import os
 import random
@@ -7,6 +10,7 @@ from collections import defaultdict
 
 import markovify
 from telegram import Update
+from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -17,11 +21,18 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 BOT_USERNAME = "@HuesosPizduk_bot"
 BOT_USERNAME_PLAIN = BOT_USERNAME.replace("@", "").lower()
 
-SPONTANEOUS_CHANCE = 0.01          # шанс спонтанной генерации на каждое сообщение
+DEFAULT_CHANCE = 0.01              # шанс спонтанной генерации по умолчанию (можно менять через /chance)
+REACTION_CHANCE = 0.03             # шанс поставить эмодзи-реакцию вместо ответа
 REBUILD_EVERY_N_MESSAGES = 5       # раз в сколько новых сообщений пересобирать модель
 HISTORY_LIMIT = 10                 # сколько последних фраз помнить, чтобы не повторяться
+SETTINGS_FILE = "chat_settings.json"
+
 FALLBACK_NO_MODEL = "Я аутист и мне не хватает слов 😅"
 FALLBACK_NO_PHRASE = "Я не могу придумать смехуятину 🤔"
+FALLBACK_NO_START = "Не получилось придумать фразу с этим словом 🤷"
+
+# Реакции, которые Telegram разрешает ставить ботам
+REACTIONS = ["👍", "🔥", "😁", "🤔", "🤯", "😱", "🎉", "🤩", "👀", "🤡", "🗿", "💯", "🤣", "🤨", "😐", "🙈", "😎", "🤪", "🥴", "🌚"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -43,7 +54,90 @@ def _get_lock(chat_id: int) -> asyncio.Lock:
 
 
 # ═══════════════════════════════════════════════════
-# 3. РАБОТА С ФАЙЛАМИ (синхронные функции, вызываются через to_thread)
+# 3. НАСТРОЙКИ ЧАТОВ (шанс, mute) — хранятся в JSON
+# ═══════════════════════════════════════════════════
+_settings: dict[str, dict] = {}
+_settings_lock = asyncio.Lock()
+
+
+def load_settings() -> None:
+    global _settings
+    if not os.path.exists(SETTINGS_FILE):
+        return
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            _settings = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.warning("Не удалось прочитать %s: %s", SETTINGS_FILE, e)
+        _settings = {}
+
+
+def _save_settings_sync(data: dict) -> None:
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS_FILE)  # атомарная замена, файл не останется битым
+
+
+async def set_setting(chat_id: int, key: str, value) -> None:
+    async with _settings_lock:
+        _settings.setdefault(str(chat_id), {})[key] = value
+        snapshot = copy.deepcopy(_settings)
+        await asyncio.to_thread(_save_settings_sync, snapshot)
+
+
+def get_chance(chat_id: int) -> float:
+    return _settings.get(str(chat_id), {}).get("chance", DEFAULT_CHANCE)
+
+
+def is_muted(chat_id: int) -> bool:
+    return _settings.get(str(chat_id), {}).get("muted", False)
+
+
+# ═══════════════════════════════════════════════════
+# 4. ПРОВЕРКА АДМИНОВ
+# ═══════════════════════════════════════════════════
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat is None or msg is None:
+        return False
+
+    # В личке с ботом человек сам себе админ
+    if chat.type == ChatType.PRIVATE:
+        return True
+
+    # Админ, пишущий анонимно (от имени группы)
+    if msg.sender_chat and msg.sender_chat.id == chat.id:
+        return True
+
+    user = update.effective_user
+    if user is None:
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except TelegramError as e:
+        logger.warning("Не удалось проверить права %s в чате %s: %s", user.id, chat.id, e)
+        return False
+    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
+def admin_only(func):
+    """Декоратор: команду могут выполнять только админы чата."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message:
+            return
+        if not await is_admin(update, context):
+            await update.message.reply_text("🚫 Эту команду могут использовать только админы чата.")
+            return
+        await func(update, context)
+    return wrapper
+
+
+# ═══════════════════════════════════════════════════
+# 5. РАБОТА С ФАЙЛАМИ (синхронные функции, вызываются через to_thread)
 # ═══════════════════════════════════════════════════
 
 def get_corpus_file(chat_id: int) -> str:
@@ -85,7 +179,7 @@ async def clear_corpus(chat_id: int) -> None:
 
 
 # ═══════════════════════════════════════════════════
-# 4. МОДЕЛЬ МАРКОВА (кэшируется, не пересобирается на каждое сообщение)
+# 6. МОДЕЛЬ МАРКОВА (кэшируется, не пересобирается на каждое сообщение)
 # ═══════════════════════════════════════════════════
 
 def _build_model(corpus: str):
@@ -123,10 +217,27 @@ def invalidate_model_cache(chat_id: int) -> None:
 
 
 # ═══════════════════════════════════════════════════
-# 5. ГЕНЕРАЦИЯ ФРАЗ
+# 7. ГЕНЕРАЦИЯ ФРАЗ
 # ═══════════════════════════════════════════════════
 
-async def generate_phrase(chat_id: int) -> str:
+def _make_sentence(model, start: str | None = None):
+    """Генерирует одно предложение. Если задано слово start — пытается
+    построить фразу вокруг него (пробуя разные регистры)."""
+    if start:
+        for variant in dict.fromkeys((start, start.lower(), start.capitalize())):
+            try:
+                phrase = model.make_sentence_with_start(
+                    variant, strict=False, max_words=50, tries=100
+                )
+            except Exception:  # слова нет в корпусе (ParamError/KeyError)
+                continue
+            if phrase:
+                return phrase
+        return None
+    return model.make_sentence(max_words=50, tries=100)
+
+
+async def generate_phrase(chat_id: int, start: str | None = None) -> str:
     model = await get_markov_model(chat_id)
     if model is None:
         return FALLBACK_NO_MODEL
@@ -145,7 +256,7 @@ async def generate_phrase(chat_id: int) -> str:
     attempts = 20  # больше попыток компенсирует малое число возможных фраз
 
     for _ in range(attempts):
-        phrase = await asyncio.to_thread(model.make_sentence, max_words=50, tries=100)
+        phrase = await asyncio.to_thread(_make_sentence, model, start)
         if not phrase or len(phrase.split()) <= 1:
             continue
         if best_phrase is None:
@@ -164,12 +275,12 @@ async def generate_phrase(chat_id: int) -> str:
             history.pop(0)
         return best_phrase
 
-    return FALLBACK_NO_PHRASE
+    return FALLBACK_NO_START if start else FALLBACK_NO_PHRASE
 
 
 def is_real_phrase(phrase: str) -> bool:
     """True только если это настоящая сгенерированная фраза, а не fallback-заглушка."""
-    return phrase not in (FALLBACK_NO_MODEL, FALLBACK_NO_PHRASE)
+    return phrase not in (FALLBACK_NO_MODEL, FALLBACK_NO_PHRASE, FALLBACK_NO_START)
 
 
 async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text=None) -> None:
@@ -182,28 +293,50 @@ async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text=No
         logger.warning("Не удалось отправить сообщение в чат %s: %s", chat_id, e)
 
 
+async def reply_if_real_phrase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает фразой, только если удалось сгенерировать настоящую (без заглушек)."""
+    phrase = await generate_phrase(update.message.chat_id)
+    if is_real_phrase(phrase):
+        await send_reply(update, context, text=phrase)
+
+
+async def react_to_message(update: Update) -> None:
+    """Ставит случайную эмодзи-реакцию на сообщение (нужен python-telegram-bot 21+)."""
+    try:
+        await update.message.set_reaction(random.choice(REACTIONS))
+    except (TelegramError, AttributeError) as e:
+        logger.warning("Не удалось поставить реакцию в чате %s: %s", update.message.chat_id, e)
+
+
 # ═══════════════════════════════════════════════════
-# 6. ОБРАБОТЧИКИ КОМАНД
+# 8. ОБРАБОТЧИКИ КОМАНД
 # ═══════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я бот-генератор на цепях Маркова.\n\n"
         "📝 Упомяни меня или ответь на моё сообщение, чтобы я сгенерировал фразу.\n"
-        "🎲 Иногда я пишу сам, если мне есть что сказать.\n\n"
-        "ℹ️ Я запоминаю сообщения из этого чата, чтобы учиться на них говорить. "
-        "Удалить всё можно командой /clear.\n\n"
-        "Команды:\n"
-        "/gen — сгенерировать вручную\n"
-        "/clear — очистить память этого чата\n"
-        "/stats — статистика по этому чату"
+        "🎲 Иногда я пишу сам или ставлю реакции, если мне есть что сказать.\n\n"
+        "ℹ️ Я запоминаю сообщения из этого чата, чтобы учиться на них говорить.\n\n"
+        "Команды для всех:\n"
+        "/gen — сгенерировать фразу\n"
+        "/gen слово — фраза со словом\n"
+        "/stats — статистика по этому чату\n\n"
+        "Только для админов:\n"
+        "/chance 5 — шанс спонтанных сообщений в % (0–100)\n"
+        "/mute — заставить меня молчать (но учиться я продолжу)\n"
+        "/unmute — снова разрешить говорить\n"
+        "/clear — очистить память этого чата"
     )
 
 
 async def gen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_reply(update, context)
+    start_word = context.args[0] if context.args else None
+    phrase = await generate_phrase(update.message.chat_id, start_word)
+    await send_reply(update, context, text=phrase)
 
 
+@admin_only
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     async with _get_lock(chat_id):
@@ -213,20 +346,64 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🗑️ Память этого чата очищена!")
 
 
+@admin_only
+async def chance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.message.chat_id
+
+    if not context.args:
+        await update.message.reply_text(
+            f"🎲 Сейчас я пишу сам с шансом {get_chance(chat_id) * 100:g}% на каждое сообщение.\n"
+            "Изменить: /chance 5"
+        )
+        return
+
+    raw = context.args[0].replace(",", ".").rstrip("%")
+    try:
+        value = float(raw)
+    except ValueError:
+        await update.message.reply_text("Нужно число от 0 до 100, например: /chance 5")
+        return
+
+    if not 0 <= value <= 100:
+        await update.message.reply_text("Шанс должен быть от 0 до 100.")
+        return
+
+    await set_setting(chat_id, "chance", value / 100)
+    await update.message.reply_text(f"✅ Шанс спонтанных сообщений: {value:g}%")
+
+
+@admin_only
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_setting(update.message.chat_id, "muted", True)
+    await update.message.reply_text(
+        "🤐 Молчу. Спонтанные сообщения, реакции и ответы на упоминания отключены, "
+        "но я продолжаю учиться. Команда /gen всё ещё работает."
+    )
+
+
+@admin_only
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_setting(update.message.chat_id, "muted", False)
+    await update.message.reply_text("🔊 Снова на связи!")
+
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     corpus = await load_corpus(chat_id)
     lines = corpus.splitlines() if corpus else []
     word_count = len(corpus.split())
+    status = "молчу 🤐" if is_muted(chat_id) else "говорю 🔊"
     await update.message.reply_text(
         f"📊 В этом чате запомнено:\n"
         f"Сообщений: {len(lines)}\n"
-        f"Слов: {word_count}"
+        f"Слов: {word_count}\n\n"
+        f"Статус: {status}\n"
+        f"Шанс спонтанных сообщений: {get_chance(chat_id) * 100:g}%"
     )
 
 
 # ═══════════════════════════════════════════════════
-# 7. ОБРАБОТКА СООБЩЕНИЙ
+# 9. ОБРАБОТКА СООБЩЕНИЙ
 # ═══════════════════════════════════════════════════
 
 def _is_reply_to_bot(update: Update) -> bool:
@@ -251,34 +428,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     is_reply_to_bot = _is_reply_to_bot(update)
 
     # Сохраняем сообщение в файл этого чата (от 2 слов — одиночные слова
-    # почти не дают полезных переходов для цепи Маркова)
+    # почти не дают полезных переходов для цепи Маркова).
+    # Учимся всегда, даже когда бот в муте.
     clean = clean_text(text)
     if clean and len(clean.split()) >= 2:
         async with _get_lock(chat_id):
             await save_message(chat_id, clean)
 
+    if is_muted(chat_id):
+        return
+
     if is_mentioned or is_reply_to_bot:
         await send_reply(update, context)
         return
 
-    if random.random() < SPONTANEOUS_CHANCE:
-        phrase = await generate_phrase(chat_id)
-        if is_real_phrase(phrase):
-            await send_reply(update, context, text=phrase)
+    if random.random() < get_chance(chat_id):
+        await reply_if_real_phrase(update, context)
+    elif random.random() < REACTION_CHANCE:
+        await react_to_message(update)
 
 
-async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Реагирует на стикер только если он отправлен в ответ на сообщение бота"""
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Стикеры, фото, голосовые, видео, гифки: отвечает, если это ответ боту,
+    иначе с некоторым шансом пишет фразу или ставит реакцию."""
     if not update.message:
         return
+
+    chat_id = update.message.chat_id
+    if is_muted(chat_id):
+        return
+
     if _is_reply_to_bot(update):
-        phrase = await generate_phrase(update.message.chat_id)
-        if is_real_phrase(phrase):
-            await send_reply(update, context, text=phrase)
+        await reply_if_real_phrase(update, context)
+        return
+
+    if random.random() < get_chance(chat_id):
+        await reply_if_real_phrase(update, context)
+    elif random.random() < REACTION_CHANCE:
+        await react_to_message(update)
 
 
 # ═══════════════════════════════════════════════════
-# 8. УТИЛИТЫ
+# 10. УТИЛИТЫ
 # ═══════════════════════════════════════════════════
 
 def clean_text(text: str) -> str:
@@ -293,7 +484,7 @@ def clean_text(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════
-# 9. ГЛОБАЛЬНАЯ ОБРАБОТКА ОШИБОК
+# 11. ГЛОБАЛЬНАЯ ОБРАБОТКА ОШИБОК
 # ═══════════════════════════════════════════════════
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -301,13 +492,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ═══════════════════════════════════════════════════
-# 10. ЗАПУСК
+# 12. ЗАПУСК
 # ═══════════════════════════════════════════════════
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
 
+    load_settings()
     print("✅ Бот запущен. Жду сообщений...")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -315,9 +507,16 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("gen", gen))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("chance", chance))
+    app.add_handler(CommandHandler("mute", mute))
+    app.add_handler(CommandHandler("unmute", unmute))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
+    app.add_handler(MessageHandler(
+        filters.Sticker.ALL | filters.PHOTO | filters.VOICE | filters.VIDEO
+        | filters.VIDEO_NOTE | filters.ANIMATION,
+        handle_media,
+    ))
     app.add_error_handler(error_handler)
 
     app.run_polling(drop_pending_updates=True)
