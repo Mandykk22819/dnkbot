@@ -11,7 +11,7 @@ import re
 from collections import OrderedDict, defaultdict, deque
 
 import markovify
-from telegram import Update
+from telegram import BotCommand, BotCommandScopeAllChatAdministrators, Update
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -23,8 +23,8 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 BOT_USERNAME = "@HuesosPizduk_bot"
 BOT_USERNAME_PLAIN = BOT_USERNAME.replace("@", "").lower()
 
-DEFAULT_CHANCE = 0.01              # шанс спонтанной генерации по умолчанию (можно менять через /chance)
-REACTION_CHANCE = 0.03             # шанс поставить эмодзи-реакцию вместо ответа
+DEFAULT_CHANCE = 0.05              # шанс спонтанной генерации по умолчанию (можно менять через /chance)
+REACTION_CHANCE = 0.2             # шанс поставить эмодзи-реакцию вместо ответа
 REBUILD_EVERY_N_MESSAGES = 5       # раз в сколько новых сообщений пересобирать модель
 HISTORY_LIMIT = 10                 # сколько последних фраз помнить, чтобы не повторяться
 GENERATION_ATTEMPTS = 20           # сколько раз пробовать сгенерировать неповторяющуюся фразу
@@ -38,10 +38,10 @@ MAX_MESSAGE_CHARS = 1000           # слишком длинные сообще�
 
 # Стикерпак: короткое имя из ссылки t.me/addstickers/ИМЯ_ПАКА (пустая строка = выключено)
 STICKER_PACK_NAME = "MandykPack"
-STICKER_CHANCE = 0.1               # шанс, что вместо текстового ответа бот отправит стикер из пака
+STICKER_CHANCE = 0.15               # шанс, что вместо текстового ответа бот отправит стикер из пака
 
-FALLBACK_NO_MODEL = "Мне не хватает слов"
-FALLBACK_NO_PHRASE = "Я не могу придумать ответ"
+FALLBACK_NO_MODEL = "Не хватает слов, чтобы понять вас"
+FALLBACK_NO_PHRASE = "Пока что думаю над ответом"
 FALLBACK_NO_START = "Не получилось придумать фразу с этим словом 🤷"
 
 # Реакции, которые Telegram разрешает ставить ботам
@@ -430,7 +430,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/gen СЛОВО — фраза со словом\n"
         "/stats — статистика по этому чату\n\n"
         "Админ команды:\n"
-        "/chance 0-100 — шанс спонтанных сообщений в %\n"
+        "/chance X — шанс спонтанных сообщений в %\n"
         "/mute — заставить меня молчать (но учиться я продолжу)\n"
         "/unmute — снова разрешить говорить"
     )
@@ -591,6 +591,26 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # 12. ЗАПУСК
 # ═══════════════════════════════════════════════════
 
+async def setup_commands(app) -> None:
+    """Задаёт меню команд (кнопка «/» или «Меню» рядом с полем ввода).
+    Обычные пользователи видят общие команды, а админы групп ещё и админские."""
+    public = [
+        BotCommand("gen", "Сгенерировать фразу (можно: /gen слово)"),
+        BotCommand("stats", "Статистика этого чата"),
+        BotCommand("start", "О боте и список команд"),
+    ]
+    admin = public + [
+        BotCommand("chance", "Шанс спонтанных сообщений в % (/chance 5)"),
+        BotCommand("mute", "Заставить бота молчать"),
+        BotCommand("unmute", "Снова разрешить боту говорить"),
+    ]
+    try:
+        await app.bot.set_my_commands(public)
+        await app.bot.set_my_commands(admin, scope=BotCommandScopeAllChatAdministrators())
+    except TelegramError as e:
+        logger.warning("Не удалось задать меню команд: %s", e)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
@@ -598,7 +618,7 @@ def main():
     load_settings()
     print("✅ Бот запущен. Жду сообщений...")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("gen", gen))
